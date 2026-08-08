@@ -1,0 +1,14 @@
+{
+	"name": "hedgehog-market",
+	"version": "1.0.0",
+	"description": "API de vente de commandes GoatBot (catalogue + achats + proxy raw pastebin)",
+	"main": "index.js",
+	"scripts": {
+		"start": "node server.js"
+	},
+	"dependencies": {
+		"express": "^4.19.2",
+		"cors": "^2.8.5",
+		"@upstash/redis": "^1.31.6"
+	}
+}
