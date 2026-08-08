@@ -13,7 +13,7 @@ const redis = new Redis({
 
 const ITEM_PREFIX = "item:";
 const OWNED_PREFIX = "owned:";
-const ADMIN_KEY = Hedgehog-store-2026;
+const ADMIN_KEY = process.env.HEDGEHOG_ADMIN_KEY;
 
 function requireAdmin(req, res, next) {
 	const key = req.headers["x-admin-key"];
