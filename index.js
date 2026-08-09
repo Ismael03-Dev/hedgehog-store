@@ -13,8 +13,14 @@ const redis = new Redis({
 
 const ITEM_PREFIX = "item:";
 const OWNED_PREFIX = "owned:";
-const COUNTER_KEY = "market:next_id";
-const ADMIN_KEY = "hedgehog-store-2026";
+const ADMIN_KEY = process.env.HEDGEHOG_ADMIN_KEY;
+
+const BROWSER_HEADERS = {
+	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"Accept": "text/plain,text/html,application/xhtml+xml,*/*;q=0.8",
+	"Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+	"Referer": "https://pastebin.com/"
+};
 
 function requireAdmin(req, res, next) {
 	const key = req.headers["x-admin-key"];
@@ -27,24 +33,14 @@ function requireAdmin(req, res, next) {
 	next();
 }
 
-// Prix stockés en string décimale (comme l'API cash) pour supporter des montants énormes sans perte de précision
-function isValidAmountString(str) {
-	return typeof str === "string" && /^\d+$/.test(str);
-}
-
-async function getNextId() {
-	const next = await redis.incr(COUNTER_KEY);
-	return String(next);
-}
-
-async function getItem(id) {
-	const raw = await redis.get(`${ITEM_PREFIX}${id}`);
+async function getItem(itemId) {
+	const raw = await redis.get(`${ITEM_PREFIX}${itemId}`);
 	if (!raw) return null;
 	return typeof raw === "string" ? JSON.parse(raw) : raw;
 }
 
-async function saveItem(id, data) {
-	await redis.set(`${ITEM_PREFIX}${id}`, JSON.stringify(data));
+async function saveItem(itemId, data) {
+	await redis.set(`${ITEM_PREFIX}${itemId}`, JSON.stringify(data));
 }
 
 async function getAllItems() {
@@ -55,8 +51,7 @@ async function getAllItems() {
 		const item = typeof raw === "string" ? JSON.parse(raw) : raw;
 		if (item) items.push(item);
 	}
-	// tri numérique par id (1, 2, 3... et pas "1", "10", "2")
-	return items.sort((a, b) => Number(a.id) - Number(b.id));
+	return items.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
 }
 
 async function getOwned(userId) {
@@ -69,20 +64,36 @@ async function saveOwned(userId, list) {
 	await redis.set(`${OWNED_PREFIX}${userId}`, JSON.stringify(list));
 }
 
+async function fetchPastebinRaw(pastebinId) {
+	const url = `https://pastebin.com/raw/${pastebinId}`;
+	let lastStatus = null;
+
+	for (let attempt = 0; attempt < 2; attempt++) {
+		const response = await fetch(url, { headers: BROWSER_HEADERS });
+		lastStatus = response.status;
+		if (response.ok) {
+			return { ok: true, text: await response.text() };
+		}
+		if (response.status !== 429 && response.status !== 403) break;
+	}
+
+	return { ok: false, status: lastStatus };
+}
+
 app.get("/", (req, res) => {
 	res.json({
 		message: "Hedgehog Market API opérationnelle",
-		version: "2.0",
+		version: "1.2",
 		endpoints: {
 			"GET /api/market/items": "Liste tous les items en vente",
-			"GET /api/market/items/:id": "Détail d'un item (id court, ex: 3)",
-			"POST /api/market/items": "Ajouter un item (admin, header x-admin-key) { pastebinId, name, description, price }",
-			"PUT /api/market/items/:id": "Modifier un item (admin)",
-			"DELETE /api/market/items/:id": "Supprimer un item (admin)",
+			"GET /api/market/items/:itemId": "Détail d'un item",
+			"POST /api/market/items": "Ajouter un item (admin, header x-admin-key)",
+			"PUT /api/market/items/:itemId": "Modifier un item (admin)",
+			"DELETE /api/market/items/:itemId": "Supprimer un item (admin)",
 			"POST /api/market/purchase": "Enregistrer un achat { userId, itemId, userName }",
 			"GET /api/market/owns/:userId/:itemId": "Vérifie si un user possède un item",
 			"GET /api/market/inventory/:userId": "Liste les items possédés par un user",
-			"GET /raw/:id": "Contenu brut de la commande (proxy Pastebin, id court)"
+			"GET /raw/:itemId": "Contenu brut de la commande (proxy Pastebin)"
 		}
 	});
 });
@@ -96,9 +107,9 @@ app.get("/api/market/items", async (req, res) => {
 	}
 });
 
-app.get("/api/market/items/:id", async (req, res) => {
+app.get("/api/market/items/:itemId", async (req, res) => {
 	try {
-		const item = await getItem(req.params.id);
+		const item = await getItem(req.params.itemId);
 		if (!item) return res.status(404).json({ success: false, error: "Item introuvable" });
 		res.json({ success: true, data: item });
 	} catch (error) {
@@ -107,61 +118,44 @@ app.get("/api/market/items/:id", async (req, res) => {
 });
 
 app.post("/api/market/items", requireAdmin, async (req, res) => {
-	const { pastebinId, name, description, price, category } = req.body;
-	const priceStr = String(price);
-
-	if (!pastebinId || !name || !isValidAmountString(priceStr)) {
-		return res.status(400).json({
-			success: false,
-			error: "pastebinId, name et price (chaîne de chiffres, ex: '100000') sont requis"
-		});
+	const { itemId, name, description, price, category } = req.body;
+	if (!itemId || !name || typeof price !== "number" || Number.isNaN(price) || price < 0) {
+		return res.status(400).json({ success: false, error: "itemId, name et price (nombre positif) sont requis" });
 	}
-
 	try {
-		const id = await getNextId();
+		const existing = await getItem(itemId);
 		const item = {
-			id,
-			pastebinId,
+			itemId,
 			name,
 			description: description || "",
-			price: priceStr,
+			price,
 			category: category || "goatbot",
-			createdAt: Date.now(),
+			createdAt: existing?.createdAt || Date.now(),
 			updatedAt: Date.now()
 		};
-		await saveItem(id, item);
+		await saveItem(itemId, item);
 		res.json({ success: true, data: item });
 	} catch (error) {
 		res.status(500).json({ success: false, error: error.message });
 	}
 });
 
-app.put("/api/market/items/:id", requireAdmin, async (req, res) => {
+app.put("/api/market/items/:itemId", requireAdmin, async (req, res) => {
 	try {
-		const existing = await getItem(req.params.id);
+		const existing = await getItem(req.params.itemId);
 		if (!existing) return res.status(404).json({ success: false, error: "Item introuvable" });
-
-		const updates = { ...req.body };
-		if (updates.price !== undefined) {
-			const priceStr = String(updates.price);
-			if (!isValidAmountString(priceStr)) {
-				return res.status(400).json({ success: false, error: "price doit être une chaîne de chiffres" });
-			}
-			updates.price = priceStr;
-		}
-
-		const updated = { ...existing, ...updates, id: req.params.id, updatedAt: Date.now() };
-		await saveItem(req.params.id, updated);
+		const updated = { ...existing, ...req.body, itemId: req.params.itemId, updatedAt: Date.now() };
+		await saveItem(req.params.itemId, updated);
 		res.json({ success: true, data: updated });
 	} catch (error) {
 		res.status(500).json({ success: false, error: error.message });
 	}
 });
 
-app.delete("/api/market/items/:id", requireAdmin, async (req, res) => {
+app.delete("/api/market/items/:itemId", requireAdmin, async (req, res) => {
 	try {
-		await redis.del(`${ITEM_PREFIX}${req.params.id}`);
-		res.json({ success: true, data: { id: req.params.id, deleted: true } });
+		await redis.del(`${ITEM_PREFIX}${req.params.itemId}`);
+		res.json({ success: true, data: { itemId: req.params.itemId, deleted: true } });
 	} catch (error) {
 		res.status(500).json({ success: false, error: error.message });
 	}
@@ -215,18 +209,18 @@ app.get("/api/market/inventory/:userId", async (req, res) => {
 	}
 });
 
-app.get("/raw/:id", async (req, res) => {
+app.get("/raw/:itemId", async (req, res) => {
 	try {
-		const item = await getItem(req.params.id);
+		const item = await getItem(req.params.itemId);
 		if (!item) return res.status(404).send("Item introuvable");
 
-		const pastebinRaw = `https://pastebin.com/raw/${item.pastebinId}`;
-		const response = await fetch(pastebinRaw);
-		if (!response.ok) return res.status(502).send("Impossible de récupérer le contenu depuis Pastebin");
+		const result = await fetchPastebinRaw(req.params.itemId);
+		if (!result.ok) {
+			return res.status(502).send(`Impossible de récupérer le contenu depuis Pastebin (HTTP ${result.status || "inconnu"})`);
+		}
 
-		const text = await response.text();
 		res.setHeader("Content-Type", "text/plain; charset=utf-8");
-		res.send(text);
+		res.send(result.text);
 	} catch (error) {
 		res.status(500).send("Erreur serveur: " + error.message);
 	}
