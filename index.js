@@ -13,7 +13,7 @@ const redis = new Redis({
 
 const ITEM_PREFIX = "item:";
 const OWNED_PREFIX = "owned:";
-const ADMIN_KEY = "hedgehog-store-2026";
+const ADMIN_KEY = process.env.HEDGEHOG_ADMIN_KEY;
 
 const BROWSER_HEADERS = {
 	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -130,6 +130,7 @@ app.post("/api/market/items", requireAdmin, async (req, res) => {
 			description: description || "",
 			price,
 			category: category || "goatbot",
+			sales: existing?.sales || 0,
 			createdAt: existing?.createdAt || Date.now(),
 			updatedAt: Date.now()
 		};
@@ -180,6 +181,9 @@ app.post("/api/market/purchase", async (req, res) => {
 
 		owned.push({ itemId, name: item.name, purchasedAt: Date.now(), pricePaid: item.price, buyerName: userName || "User" });
 		await saveOwned(userId, owned);
+
+		item.sales = (item.sales || 0) + 1;
+		await saveItem(itemId, item);
 
 		res.json({
 			success: true,
