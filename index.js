@@ -13,7 +13,7 @@ const redis = new Redis({
 
 const ITEM_PREFIX = "item:";
 const OWNED_PREFIX = "owned:";
-const ADMIN_KEY = process.env.HEDGEHOG_ADMIN_KEY;
+const ADMIN_KEY = "hedgehog-store-2026";
 
 const BROWSER_HEADERS = {
 	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
