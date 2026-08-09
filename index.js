@@ -13,7 +13,7 @@ const redis = new Redis({
 
 const ITEM_PREFIX = "item:";
 const OWNED_PREFIX = "owned:";
-const ADMIN_KEY = process.env.HEDGEHOG_ADMIN_KEY;
+const ADMIN_KEY = "hedgehog-store-2026";
 
 const BROWSER_HEADERS = {
 	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -88,6 +88,7 @@ app.get("/", (req, res) => {
 			"GET /api/market/items": "Liste tous les items en vente",
 			"GET /api/market/items/:itemId": "Détail d'un item",
 			"POST /api/market/items": "Ajouter un item (admin, header x-admin-key)",
+			"POST /api/market/import-github": "Importer les .js d'un dossier GitHub (admin)",
 			"PUT /api/market/items/:itemId": "Modifier un item (admin)",
 			"DELETE /api/market/items/:itemId": "Supprimer un item (admin)",
 			"POST /api/market/purchase": "Enregistrer un achat { userId, itemId, userName }",
@@ -118,7 +119,7 @@ app.get("/api/market/items/:itemId", async (req, res) => {
 });
 
 app.post("/api/market/items", requireAdmin, async (req, res) => {
-	const { itemId, name, description, price, category } = req.body;
+	const { itemId, name, description, price, category, source, ref } = req.body;
 	if (!itemId || !name || typeof price !== "number" || Number.isNaN(price) || price < 0) {
 		return res.status(400).json({ success: false, error: "itemId, name et price (nombre positif) sont requis" });
 	}
@@ -130,12 +131,68 @@ app.post("/api/market/items", requireAdmin, async (req, res) => {
 			description: description || "",
 			price,
 			category: category || "goatbot",
+			source: source === "github" ? "github" : "pastebin",
+			ref: ref || itemId,
 			sales: existing?.sales || 0,
 			createdAt: existing?.createdAt || Date.now(),
 			updatedAt: Date.now()
 		};
 		await saveItem(itemId, item);
 		res.json({ success: true, data: item });
+	} catch (error) {
+		res.status(500).json({ success: false, error: error.message });
+	}
+});
+
+app.post("/api/market/import-github", requireAdmin, async (req, res) => {
+	const { owner, repo, path: dirPath, branch, defaultPrice, category } = req.body;
+	if (!owner || !repo || !dirPath || typeof defaultPrice !== "number" || defaultPrice < 0) {
+		return res.status(400).json({ success: false, error: "owner, repo, path et defaultPrice (nombre) sont requis" });
+	}
+	try {
+		const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${dirPath}${branch ? `?ref=${branch}` : ""}`;
+		const ghRes = await fetch(apiUrl, {
+			headers: {
+				"User-Agent": "hedgehog-market",
+				"Accept": "application/vnd.github+json"
+			}
+		});
+		if (!ghRes.ok) {
+			return res.status(502).json({ success: false, error: `GitHub a répondu HTTP ${ghRes.status}` });
+		}
+		const entries = await ghRes.json();
+		if (!Array.isArray(entries)) {
+			return res.status(502).json({ success: false, error: "Réponse GitHub inattendue (le chemin est-il un dossier ?)" });
+		}
+
+		const files = entries.filter(e => e.type === "file" && e.name.endsWith(".js"));
+		const added = [];
+		const skipped = [];
+
+		for (const file of files) {
+			const itemId = file.name.replace(/\.js$/, "");
+			const existing = await getItem(itemId);
+			if (existing) {
+				skipped.push(file.name);
+				continue;
+			}
+			const item = {
+				itemId,
+				name: file.name,
+				description: `Importé depuis ${owner}/${repo}/${dirPath}`,
+				price: defaultPrice,
+				category: category || "goatbot",
+				source: "github",
+				ref: file.download_url,
+				sales: 0,
+				createdAt: Date.now(),
+				updatedAt: Date.now()
+			};
+			await saveItem(itemId, item);
+			added.push(file.name);
+		}
+
+		res.json({ success: true, data: { total: files.length, added, skipped } });
 	} catch (error) {
 		res.status(500).json({ success: false, error: error.message });
 	}
@@ -218,7 +275,17 @@ app.get("/raw/:itemId", async (req, res) => {
 		const item = await getItem(req.params.itemId);
 		if (!item) return res.status(404).send("Item introuvable");
 
-		const result = await fetchPastebinRaw(req.params.itemId);
+		if (item.source === "github") {
+			const ghRes = await fetch(item.ref, { headers: BROWSER_HEADERS });
+			if (!ghRes.ok) {
+				return res.status(502).send(`Impossible de récupérer le contenu depuis GitHub (HTTP ${ghRes.status})`);
+			}
+			res.setHeader("Content-Type", "text/plain; charset=utf-8");
+			return res.send(await ghRes.text());
+		}
+
+		const pastebinId = item.ref || req.params.itemId;
+		const result = await fetchPastebinRaw(pastebinId);
 		if (!result.ok) {
 			return res.status(502).send(`Impossible de récupérer le contenu depuis Pastebin (HTTP ${result.status || "inconnu"})`);
 		}
