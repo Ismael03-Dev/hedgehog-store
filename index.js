@@ -89,6 +89,9 @@ app.get("/", (req, res) => {
 			"GET /api/market/items/:itemId": "Détail d'un item",
 			"POST /api/market/items": "Ajouter un item (admin, header x-admin-key)",
 			"POST /api/market/import-github": "Importer les .js d'un dossier GitHub (admin)",
+			"POST /api/market/upload-inline": "Uploader un fichier local directement (admin)",
+			"POST /api/market/items/:itemId/like": "Liker un item { userId }",
+			"GET /api/market/status": "Statistiques globales du marketplace",
 			"PUT /api/market/items/:itemId": "Modifier un item (admin)",
 			"DELETE /api/market/items/:itemId": "Supprimer un item (admin)",
 			"POST /api/market/purchase": "Enregistrer un achat { userId, itemId, userName }",
@@ -112,7 +115,63 @@ app.get("/api/market/items/:itemId", async (req, res) => {
 	try {
 		const item = await getItem(req.params.itemId);
 		if (!item) return res.status(404).json({ success: false, error: "Item introuvable" });
+		if (req.query.view !== "false") {
+			item.views = (item.views || 0) + 1;
+			await saveItem(req.params.itemId, item);
+		}
 		res.json({ success: true, data: item });
+	} catch (error) {
+		res.status(500).json({ success: false, error: error.message });
+	}
+});
+
+app.post("/api/market/items/:itemId/like", async (req, res) => {
+	const { userId } = req.body;
+	if (!userId) return res.status(400).json({ success: false, error: "userId requis" });
+	try {
+		const item = await getItem(req.params.itemId);
+		if (!item) return res.status(404).json({ success: false, error: "Item introuvable" });
+
+		const likedBy = item.likedBy || [];
+		if (likedBy.includes(userId)) {
+			return res.json({ success: true, data: { alreadyLiked: true, likes: item.likes || 0 } });
+		}
+
+		likedBy.push(userId);
+		item.likedBy = likedBy;
+		item.likes = likedBy.length;
+		await saveItem(req.params.itemId, item);
+
+		res.json({ success: true, data: { alreadyLiked: false, likes: item.likes } });
+	} catch (error) {
+		res.status(500).json({ success: false, error: error.message });
+	}
+});
+
+app.get("/api/market/status", async (req, res) => {
+	try {
+		const items = await getAllItems();
+		const totalItems = items.length;
+		const totalSales = items.reduce((sum, it) => sum + (it.sales || 0), 0);
+		const totalViews = items.reduce((sum, it) => sum + (it.views || 0), 0);
+		const totalLikes = items.reduce((sum, it) => sum + (it.likes || 0), 0);
+
+		const mostSold = [...items].sort((a, b) => (b.sales || 0) - (a.sales || 0))[0] || null;
+		const mostLiked = [...items].sort((a, b) => (b.likes || 0) - (a.likes || 0))[0] || null;
+		const mostViewed = [...items].sort((a, b) => (b.views || 0) - (a.views || 0))[0] || null;
+
+		res.json({
+			success: true,
+			data: {
+				totalItems,
+				totalSales,
+				totalViews,
+				totalLikes,
+				mostSold: mostSold ? { itemId: mostSold.itemId, name: mostSold.name, sales: mostSold.sales || 0 } : null,
+				mostLiked: mostLiked ? { itemId: mostLiked.itemId, name: mostLiked.name, likes: mostLiked.likes || 0 } : null,
+				mostViewed: mostViewed ? { itemId: mostViewed.itemId, name: mostViewed.name, views: mostViewed.views || 0 } : null
+			}
+		});
 	} catch (error) {
 		res.status(500).json({ success: false, error: error.message });
 	}
@@ -137,6 +196,39 @@ app.post("/api/market/items", requireAdmin, async (req, res) => {
 			createdAt: existing?.createdAt || Date.now(),
 			updatedAt: Date.now()
 		};
+		await saveItem(itemId, item);
+		res.json({ success: true, data: item });
+	} catch (error) {
+		res.status(500).json({ success: false, error: error.message });
+	}
+});
+
+const CODE_PREFIX = "code:";
+
+app.post("/api/market/upload-inline", requireAdmin, async (req, res) => {
+	const { itemId, name, description, price, code, category, authorName } = req.body;
+	if (!itemId || !name || !code || typeof price !== "number" || Number.isNaN(price) || price < 0) {
+		return res.status(400).json({ success: false, error: "itemId, name, code et price (nombre) sont requis" });
+	}
+	try {
+		const existing = await getItem(itemId);
+		const item = {
+			itemId,
+			name,
+			description: description || "",
+			price,
+			category: category || "goatbot",
+			authorName: authorName || "",
+			source: "inline",
+			ref: itemId,
+			views: existing?.views || 0,
+			likes: existing?.likes || 0,
+			likedBy: existing?.likedBy || [],
+			sales: existing?.sales || 0,
+			createdAt: existing?.createdAt || Date.now(),
+			updatedAt: Date.now()
+		};
+		await redis.set(`${CODE_PREFIX}${itemId}`, code);
 		await saveItem(itemId, item);
 		res.json({ success: true, data: item });
 	} catch (error) {
@@ -274,6 +366,13 @@ app.get("/raw/:itemId", async (req, res) => {
 	try {
 		const item = await getItem(req.params.itemId);
 		if (!item) return res.status(404).send("Item introuvable");
+
+		if (item.source === "inline") {
+			const code = await redis.get(`${CODE_PREFIX}${req.params.itemId}`);
+			if (!code) return res.status(404).send("Code introuvable");
+			res.setHeader("Content-Type", "text/plain; charset=utf-8");
+			return res.send(code);
+		}
 
 		if (item.source === "github") {
 			const ghRes = await fetch(item.ref, { headers: BROWSER_HEADERS });
